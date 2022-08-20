@@ -1,0 +1,10 @@
+name: dispax
+channels:
+  - conda-forge
+dependencies:
+  - jax
+  - jax-md
+  - python
+  - pytest
+  - pytest-cov
+  - coverage
