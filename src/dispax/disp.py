@@ -21,39 +21,22 @@ Example
 >>> positions1 = jnp.concatenate(
 ...    (positions0[:3, :], positions0[3:, :] + jnp.array([100.0, 0.0, 0.0])), axis=0
 ... )
->>> c6 = jnp.array([
-...     [10.4125013,  5.4365230,  5.4351273, 10.4113941,  5.4319568,
-...      13.6274719,  5.4359927,  5.4365005,  5.4364958],
-...     [ 5.4365230,  3.0927703,  3.0918815,  5.4358449,  3.0898616,
-...       7.4717073,  3.0924325,  3.0927563,  3.0927527],
-...     [ 5.4351273,  3.0918815,  3.0909929,  5.4344497,  3.0889738,
-...       7.4696641,  3.0915439,  3.0918674,  3.0918639],
-...     [10.4113941,  5.4358449,  5.4344497, 10.4102859,  5.4312797,
-...      13.6258793,  5.4353147,  5.4358230,  5.4358177],
-...     [ 5.4319568,  3.0898616,  3.0889740,  5.4312797,  3.0869563,
-...       7.4650211,  3.0895240,  3.0898473,  3.0898442],
-...     [13.6274719,  7.4717073,  7.4696641, 13.6258793,  7.4650211,
-...      18.3402557,  7.4709311,  7.4716754,  7.4716673],
-...     [ 5.4359927,  3.0924325,  3.0915437,  5.4353147,  3.0895243,
-...       7.4709306,  3.0920947,  3.0924184,  3.0924149],
-...     [ 5.4365005,  3.0927560,  3.0918674,  5.4358230,  3.0898476,
-...       7.4716749,  3.0924184,  3.0927420,  3.0927389],
-...     [ 5.4364958,  3.0927529,  3.0918639,  5.4358177,  3.0898442,
-...       7.4716673,  3.0924149,  3.0927389,  3.0927355],
-... ])
 >>> param = dict(s6=1.0, a1=0.49484001, s8=0.78981345, a2=5.73083694)  # r²SCAN-D3(BJ)
+>>> ref = Reference.from_numbers(numbers)
+>>> data = Data.from_numbers(numbers)
 >>> displacement_fn, shift_fn = space.free()
->>> r4r2 = data.sqrt_z_r4_over_r2[numbers]
->>> qq = 3 * r4r2.reshape(-1, 1) * r4r2.reshape(1, -1)
->>> energy_fn = rational_damping_pair(displacement_fn, c6=c6, qq=qq, **param)
+>>> energy_fn = dispersion(displacement_fn, **param, data=data, ref=ref)
 >>> energy_fn(positions0) - energy_fn(positions1)
-DeviceArray(-0.00039647, dtype=float32)
+DeviceArray(-0.00039642, dtype=float32)
 """
 
+from functools import partial
 import jax.numpy as jnp
 from jax_md import energy, smap, space
 
-from . import data, util
+from . import ncoord, model, util
+from .data import Data
+from .reference import Reference
 from .typing import Array, Callable
 
 
@@ -61,6 +44,7 @@ def rational_damping(
     dr: Array,
     c6: Array,
     qq: Array,
+    rvdw: Array,
     s6: Array,
     s8: Array,
     a1: Array,
@@ -77,6 +61,8 @@ def rational_damping(
         Dispersion coefficients.
     qq : Array
         Fraction between C8 / C6 coefficient.
+    rvdw: Array
+        Van der Waals radii for pairs of atoms.
     s6 : Array
         Scaling parameter for dipole-dipole interaction.
     s8 : Array
@@ -90,6 +76,25 @@ def rational_damping(
     -------
     Array
         Dispersion energy.
+
+    Example
+    -------
+    >>> numbers = jnp.array([6, 8, 7, 1, 1, 1])
+    >>> positions = jnp.array([
+    ...     [-0.55569743203406, +1.09030425468557, +0.00000000000000],
+    ...     [+0.51473634678469, +3.15152550263611, +0.00000000000000],
+    ...     [+0.59869690244446, -1.16861263789477, +0.00000000000000],
+    ...     [-0.45355203669134, -2.74568780438064, +0.00000000000000],
+    ...     [+2.52721209544999, -1.29200800956867, +0.00000000000000],
+    ...     [-2.63139587595376, +0.96447869452240, +0.00000000000000],
+    ... ])
+    >>> param = dict(s6=1.0, a1=0.4535, s8=1.9435, a2=4.4752)  # TPSS-D3(BJ)
+    >>> ref = Reference.from_numbers(numbers)
+    >>> data = Data.from_numbers(numbers)
+    >>> displ, shift = space.free()
+    >>> energy_fn = dispersion(displ, **param, data=data, ref=ref, damping_fn=rational_damping)
+    >>> energy_fn(positions)
+    DeviceArray(-0.00311339, dtype=float32)
     """
 
     dr2 = dr * dr
@@ -104,65 +109,132 @@ def rational_damping(
     return -c6 * (s6 / (dr6 + rr6) + s8 * qq / (dr8 + rr8))
 
 
-def rational_damping_pair(
-    displacement_or_metric: space.DisplacementOrMetricFn,
+def zero_damping(
+    dr: Array,
     c6: Array,
     qq: Array,
+    rvdw: Array,
     s6: Array,
     s8: Array,
-    a1: Array,
-    a2: Array,
-    r_onset: Array = 55.0,
-    r_cutoff: Array = 60.0,
-    per_particle: bool = False,
-) -> Callable[[Array], Array]:
+    rs6: Array,
+    rs8: Array,
+    alp6: Array,
+) -> Array:
     """
-    Convenience function to create a rational damping function.
+    Zero damping function.
 
     Parameters
     ----------
-    displacement_or_metric : DisplacementOrMetricFn
-        Function to compute the displacement between two atoms.
+    dr : Array
+        Interatomic distance.
     c6 : Array
         Dispersion coefficients.
     qq : Array
         Fraction between C8 / C6 coefficient.
+    rvdw: Array
+        Van der Waals radii for pairs of atoms.
     s6 : Array
         Scaling parameter for dipole-dipole interaction.
     s8 : Array
         Scaling parameter for dipole-quadrupole interaction.
-    a1 : Array
-        Scaling parameter for critical radius.
-    a2 : Array
-        Offset parameter for critical radius.
-    r_onset : Array
-        Onset for cutting off the counting function.
-    r_cutoff : Array
-        Cutoff for the counting function.
+    rs6 : Array
+        Range-separation parameter for dipole-dipole interaction.
+    rs8 : Array
+        Range-separation parameter for dipole-quadrupole interaction.
+    alp6 : Array
+        Alpha parameter for dipole-dipole interaction.
+
+    Returns
+    -------
+    Array
+        Dispersion energy.
+
+    Example
+    -------
+    >>> numbers = jnp.array([6, 8, 8, 1, 1])
+    >>> positions = jnp.array([
+    ...     [-0.53424386915034, -0.55717948166537, +0.00000000000000],
+    ...     [+0.21336223456096, +1.81136801357186, +0.00000000000000],
+    ...     [+0.82345103924195, -2.42214694643037, +0.00000000000000],
+    ...     [-2.59516465056138, -0.70672678063558, +0.00000000000000],
+    ...     [+2.09259524590881, +1.87468519515944, +0.00000000000000],
+    ... ])
+    >>> param = dict(s6=1.0, rs6=1.166, s8=1.105, rs8=1.0, alp6=14.0)  # TPSS-D3(0)
+    >>> ref = Reference.from_numbers(numbers)
+    >>> data = Data.from_numbers(numbers)
+    >>> displ, shift = space.free()
+    >>> energy_fn = dispersion(displ, **param, data=data, ref=ref, damping_fn=zero_damping)
+    >>> energy_fn(positions)
+    DeviceArray(-0.00076195, dtype=float32)
+    """
+
+    dr2 = dr * dr
+    dr6 = dr2 * dr2 * dr2
+    dr8 = dr6 * dr2
+
+    alp8 = alp6 + 2
+
+    f6 = s6 / (1 + 6 * (rs6 * rvdw / dr) ** alp6)
+    f8 = s8 / (1 + 6 * (rs8 * rvdw / dr) ** alp8)
+
+    return -c6 * (f6 / dr6 + qq * f8 / dr8)
+
+
+def dispersion(
+    displacement_fn: space.DisplacementFn,
+    data: Data,
+    ref: Reference,
+    cn_onset: Array = 20.0,
+    cn_cutoff: Array = 25.0,
+    e2_onset: Array = 55.0,
+    e2_cutoff: Array = 60.0,
+    damping_fn: Callable[[Array, ...], Array] = rational_damping,
+    counting_fn: Callable[[Array, ...], Array] = ncoord.exp_count,
+    **damping_param: dict[str, Array],
+) -> Callable[[Array], Array]:
+    """
+    Create a dispersion energy function.
+
+    Parameters
+    ----------
+    displacement_fn : space.DisplacementFn
+        Displacement function.
+    data : Data
+        Atomic data for each atom.
+    ref : Reference
+        Dispersion coefficients for each atom.
+    damping_fn : Callable[[Array, ...], Array]
+        Damping function for computing the dispersion energy
+    counting_fn : Callable[[Array, ...], Array]
+        Counting function for computing the coordination number
+    **damping_param : dict[str, Array]
+        Parameters for the damping function.
 
     Returns
     -------
     Callable[[Array], Array]
-        Coordination number function.
+        Dispersion energy function.
     """
 
-    c6 = util.maybe_downcast(c6)
-    qq = util.maybe_downcast(qq)
-    s6 = util.maybe_downcast(s6)
-    s8 = util.maybe_downcast(s8)
-    a1 = util.maybe_downcast(a1)
-    a2 = util.maybe_downcast(a2)
+    cn_fn = energy.multiplicative_isotropic_cutoff(counting_fn, cn_onset, cn_cutoff)
+    e2_fn = energy.multiplicative_isotropic_cutoff(damping_fn, e2_onset, e2_cutoff)
 
-    return smap.pair(
-        energy.multiplicative_isotropic_cutoff(rational_damping, r_onset, r_cutoff),
-        space.canonicalize_displacement_or_metric(displacement_or_metric),
-        ignore_unused_parameters=True,
-        species=None,
-        c6=c6,
-        qq=qq,
-        s6=s6,
-        s8=s8,
-        a1=a1,
-        a2=a2,
-        reduce_axis=(1,) if per_particle else None,
-    )
+    def compute_fn(positions, **kwargs):
+        displ = partial(displacement_fn, **kwargs)
+        dR = space.map_product(displ)(positions, positions)
+        dr = space.distance(dR)
+
+        mask = dr > 0
+
+        cn = jnp.sum(jnp.where(mask, cn_fn(dr, rc=data.rc), 0), -1)
+        weights = model.weight_references(cn, ref, model.gaussian_weight)
+        c6 = model.atomic_c6(weights, ref)
+
+        energy = jnp.where(
+            mask,
+            e2_fn(dr, c6=c6, qq=data.qq, rvdw=data.rvdw, **damping_param) / 2,
+            0,
+        )
+        return jnp.sum(energy)
+
+    return compute_fn
